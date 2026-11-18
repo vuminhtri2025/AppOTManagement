@@ -5,26 +5,57 @@ on:
     branches: [main, master]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
+      # Nếu repo có file .zip ở thư mục gốc thì giải nén rồi build từ đó,
+      # nếu không thì build trực tiếp từ mã nguồn trong repo.
       - name: Giải nén zip (hoặc dùng mã nguồn trực tiếp)
         run: |
-          mkdir -p /tmp/src
+          rm -rf /tmp/src && mkdir -p /tmp/src
           shopt -s nullglob
           zips=(*.zip)
           if [ ${#zips[@]} -gt 0 ]; then
-            echo "Giải nén ${zips[0]}"
+            echo "Giải nén: ${zips[0]}"
             unzip -q -o "${zips[0]}" -d /tmp/src
           else
+            echo "Không có file zip, dùng mã nguồn trong repo"
             cp -r . /tmp/src/
           fi
-          SETTINGS=$(find /tmp/src -name settings.gradle.kts -not -path '*/.git/*' | head -1)
-          if [ -z "$SETTINGS" ]; then echo "Không tìm thấy settings.gradle.kts"; exit 1; fi
+          SETTINGS=$(find /tmp/src -name settings.gradle.kts \
+            -not -path '*/.git/*' -not -path '*/__MACOSX/*' | head -1)
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::Không tìm thấy settings.gradle.kts"
+            exit 1
+          fi
           echo "ROOT=$(dirname "$SETTINGS")" >> "$GITHUB_ENV"
+
+      # Kiểm tra cấu trúc dự án và keystore trước khi build
+      - name: Kiểm tra cấu trúc dự án và keystore
+        working-directory: ${{ env.ROOT }}
+        run: |
+          for f in build.gradle.kts settings.gradle.kts app/build.gradle.kts \
+                   app/src/main/AndroidManifest.xml app/keystore/otmanager.jks; do
+            if [ ! -f "$f" ]; then echo "::error::Thiếu file: $f"; exit 1; fi
+          done
+          # Mật khẩu / alias lấy từ app/build.gradle.kts (đã tích hợp sẵn trong code)
+          STOREPASS=$(grep -m1 'storePassword' app/build.gradle.kts | sed -E 's/.*"([^"]*)".*/\1/')
+          ALIAS=$(grep -m1 'keyAlias' app/build.gradle.kts | sed -E 's/.*"([^"]*)".*/\1/')
+          keytool -list -keystore app/keystore/otmanager.jks -storepass "$STOREPASS" -alias "$ALIAS" > /tmp/ks.txt
+          cat /tmp/ks.txt
+          KS_SHA=$(grep -m1 'SHA-256' /tmp/ks.txt | sed 's/.*: //' | tr -d ':' | tr 'A-F' 'a-f')
+          echo "KS_SHA=$KS_SHA" >> "$GITHUB_ENV"
 
       - uses: actions/setup-java@v4
         with:
@@ -35,12 +66,35 @@ jobs:
         with:
           gradle-version: 8.9
 
+      # Bản release bật R8 (thu nhỏ + làm rối mã), ký bằng keystore nằm sẵn trong dự án
+      # (app/keystore/otmanager.jks) nên APK cài đè được lên bản cũ.
       - name: Build release APK
         working-directory: ${{ env.ROOT }}
         run: gradle assembleRelease --no-daemon --stacktrace
 
+      # Xác nhận APK được ký đúng bằng keystore của dự án
+      - name: Kiểm tra chữ ký APK
+        working-directory: ${{ env.ROOT }}
+        run: |
+          APK=$(ls app/build/outputs/apk/release/*.apk | head -1)
+          APKSIGNER=$(ls -d "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
+          "$APKSIGNER" verify --print-certs "$APK" | tee /tmp/sig.txt
+          APK_SHA=$(grep -m1 'SHA-256 digest' /tmp/sig.txt | sed 's/.*: //' | tr -d ' ' | tr 'A-F' 'a-f')
+          if [ "$APK_SHA" != "$KS_SHA" ]; then
+            echo "::error::APK không được ký bằng keystore của dự án"
+            exit 1
+          fi
+          echo "Chữ ký APK khớp keystore: $APK_SHA"
+
       - uses: actions/upload-artifact@v4
         with:
-          name: AIManager-apk
+          name: OvertimeManager-release-apk
           path: ${{ env.ROOT }}/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
 
+      # File mapping để dịch stacktrace khi app báo lỗi (không cần cài lên điện thoại)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: R8-mapping
+          path: ${{ env.ROOT }}/app/build/outputs/mapping/release/mapping.txt
+          if-no-files-found: warn
